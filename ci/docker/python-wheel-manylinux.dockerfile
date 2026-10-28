@@ -24,6 +24,11 @@ ARG manylinux
 
 ENV MANYLINUX_VERSION=${manylinux}
 
+# CentOS 7 (manylinux2014) is EOL: its mirrorlist host is gone, use the vault.
+RUN if ls /etc/yum.repos.d/CentOS-*.repo >/dev/null 2>&1; then \
+      sed -i 's/mirrorlist/#mirrorlist/g; s|#\?baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo; \
+    fi
+
 # Ensure dnf is installed, especially for the manylinux2014 base
 RUN yum install -y dnf
 

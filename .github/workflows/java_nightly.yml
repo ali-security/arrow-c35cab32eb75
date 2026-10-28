@@ -28,8 +28,6 @@ on:
         description: Number of versions to keep.
         required: false
         default: 14
-  schedule:
-    - cron: '0 14 * * *'
 
 permissions:
   contents: read

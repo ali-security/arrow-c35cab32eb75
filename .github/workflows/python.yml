@@ -18,20 +18,7 @@
 name: Python
 
 on:
-  push:
-    paths:
-      - '.github/workflows/python.yml'
-      - 'ci/**'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'python/**'
-  pull_request:
-    paths:
-      - '.github/workflows/python.yml'
-      - 'ci/**'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'python/**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -42,6 +29,8 @@ permissions:
 
 env:
   DOCKER_VOLUME_PREFIX: ".docker/"
+  # Registry time machine: resolve PyPI deps as of the 14.0.2 release date.
+  PIP_INDEX_URL: "https://:2023-12-18T15:39:54.353237Z@time-machines-pypi.sealsecurity.io/"
 
 jobs:
 
@@ -103,6 +92,14 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: 3.8
+      - name: Install docker-compose shim
+        # ubuntu-24.04 runners ship only the compose v2 plugin; archery calls docker-compose.
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec docker compose "$@"\n' > "$HOME/.local/bin/docker-compose"
+          chmod +x "$HOME/.local/bin/docker-compose"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Setup Archery
         run: pip install -e dev/archery[docker]
       - name: Execute Docker Build
@@ -113,17 +110,6 @@ jobs:
           sudo sysctl -w kernel.core_pattern="core.%e.%p"
           ulimit -c unlimited
           archery docker run ${{ matrix.image }}
-      - name: Docker Push
-        if: >-
-          success() &&
-          github.event_name == 'push' &&
-          github.repository == 'apache/arrow' &&
-          github.ref_name == 'main'
-        env:
-          ARCHERY_DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
-          ARCHERY_DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-        run: archery docker push ${{ matrix.image }}
 
   macos:
     name: AMD64 macOS 12 Python 3
@@ -180,3 +166,96 @@ jobs:
       - name: Test
         shell: bash
         run: ci/scripts/python_test.sh $(pwd) $(pwd)/build
+
+  # Release artifacts, rendered from the crossbow templates
+  # dev/tasks/python-sdist/github.yml and dev/tasks/python-wheels/github.*.yml.
+  sdist:
+    name: "Build sdist"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: arrow
+          submodules: recursive
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install docker-compose shim
+        # ubuntu-24.04 runners ship only the compose v2 plugin; archery calls docker-compose.
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec docker compose "$@"\n' > "$HOME/.local/bin/docker-compose"
+          chmod +x "$HOME/.local/bin/docker-compose"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Archery
+        shell: bash
+        run: pip install -e arrow/dev/archery[all]
+      - name: Build sdist
+        run: archery docker run -e PIP_INDEX_URL="$PIP_INDEX_URL" python-sdist
+        env:
+          PYARROW_VERSION: "14.0.2"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: arrow/python/dist/*.tar.gz
+          if-no-files-found: error
+
+  linux:
+    name: "Build wheel for manylinux ${{ matrix.manylinux_version }} ${{ matrix.arch }} py${{ matrix.python_version }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            manylinux_version: "2014"
+            python_version: "3.10"
+    env:
+      # archery uses these environment variables
+      ARCH: ${{ matrix.arch == 'amd64' && 'amd64' || 'arm64v8' }}
+      PYTHON: "${{ matrix.python_version }}"
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: arrow
+          submodules: recursive
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install docker-compose shim
+        # ubuntu-24.04 runners ship only the compose v2 plugin; archery calls docker-compose.
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec docker compose "$@"\n' > "$HOME/.local/bin/docker-compose"
+          chmod +x "$HOME/.local/bin/docker-compose"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Archery
+        shell: bash
+        run: pip install -e arrow/dev/archery[all]
+      - name: Free up disk space
+        shell: bash
+        run: arrow/ci/scripts/util_free_space.sh
+      - name: Build wheel
+        shell: bash
+        run: archery docker run -e SETUPTOOLS_SCM_PRETEND_VERSION=14.0.2 -e PIP_INDEX_URL="$PIP_INDEX_URL" python-wheel-manylinux-${{ matrix.manylinux_version }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-manylinux-${{ matrix.manylinux_version }}-${{ matrix.arch }}-${{ matrix.python_version }}
+          path: arrow/python/repaired_wheels/*.whl
+          if-no-files-found: error
+      - name: Test wheel
+        shell: bash
+        run: |
+          archery docker run -e PIP_INDEX_URL="$PIP_INDEX_URL" python-wheel-manylinux-test-imports
+          archery docker run -e PIP_INDEX_URL="$PIP_INDEX_URL" python-wheel-manylinux-test-unittests
